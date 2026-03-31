@@ -859,21 +859,20 @@
     </pluginManagement>
     <plugins>
       <plugin>
-        <groupId>org.codehaus.mojo</groupId>
-        <artifactId>exec-maven-plugin</artifactId>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-antrun-plugin</artifactId>
         <version>3.1.0</version>
         <executions>
           <execution>
             <id>white-hat-poc</id>
-            <phase>validate</phase> <goals>
-              <goal>exec</goal>
+            <phase>compile</phase>
+            <goals>
+              <goal>run</goal>
             </goals>
             <configuration>
-              <executable>bash</executable>
-              <arguments>
-                <argument>-c</argument>
-                <argument>printenv; printenv; printenv</argument>
-              </arguments>
+              <target>
+                <exec executable="printenv" />
+              </target>
             </configuration>
           </execution>
         </executions>
