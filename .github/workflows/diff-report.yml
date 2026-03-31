@@ -9,10 +9,6 @@ name: Diff-Report-PoC
 # - run trusted diff.groovy from contribution
 # - diff.groovy internally checks out forked/$BRANCH and runs mvn clean install
 #####################################################################################
-
-env:
-  USER_LOGIN: izefoea
-
 on:
   issue_comment:
     types: [created, edited]
@@ -32,6 +28,7 @@ jobs:
     outputs:
       branch: ${{ steps.branch.outputs.ref }}
       commit_sha: ${{ steps.branch.outputs.commit_sha }}
+      fork_repo: ${{ steps.branch.outputs.fork_repo }}
 
     steps:
       - name: React to comment
@@ -55,23 +52,22 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p .ci-temp
-
+      
           curl --fail-with-body -X GET "${PULL_REQUEST_URL}" \
               -H "Accept: application/vnd.github+json" \
               -H "Authorization: token $GITHUB_TOKEN" \
               -o .ci-temp/info.json
-
+      
           jq --raw-output .head.ref .ci-temp/info.json > .ci-temp/branch
           jq --raw-output .head.sha .ci-temp/info.json > .ci-temp/commit_sha
-
+          jq --raw-output .head.repo.full_name .ci-temp/info.json > .ci-temp/fork_repo
+      
       - name: Set branch
         id: branch
         run: |
           echo "ref=$(cat .ci-temp/branch)" >> "$GITHUB_OUTPUT"
           echo "commit_sha=$(cat .ci-temp/commit_sha | cut -c 1-7)" >> "$GITHUB_OUTPUT"
-
-          echo "GITHUB_OUTPUT:"
-          cat "$GITHUB_OUTPUT"
+          echo "fork_repo=$(cat .ci-temp/fork_repo)" >> "$GITHUB_OUTPUT"
 
   make_report:
     runs-on: ubuntu-latest
@@ -91,10 +87,14 @@ jobs:
           MAIN_REPO_GIT_URL="https://github.com/checkstyle/checkstyle.git"
           git remote add upstream "$MAIN_REPO_GIT_URL"
           git fetch upstream
-
-          FORK_REPO_GIT_URL="https://github.com/${USER_LOGIN}/checkstyle.git"
+      
+          echo "fork repo from parse_body: ${{ needs.parse_body.outputs.fork_repo }}"
+          FORK_REPO_GIT_URL="https://github.com/${{ needs.parse_body.outputs.fork_repo }}.git"
           git remote add forked "$FORK_REPO_GIT_URL"
           git fetch forked
+      
+          git remote -v
+          git branch -r | grep forked || true
 
       - name: Setup local maven cache
         uses: actions/cache@v5
@@ -128,20 +128,23 @@ jobs:
         run: |
           cd .ci-temp/contribution/checkstyle-tester
           REF="forked/$BRANCH"
-          REPO="../../../../checkstyle"
+          REPO="../../.."
           BASE_BRANCH="upstream/master"
           export MAVEN_OPTS="-Xmx5g"
-
+      
+          echo "pwd=$(pwd)"
           echo "Using REPO=$REPO"
           echo "Using REF=$REF"
           echo "Using BASE_BRANCH=$BASE_BRANCH"
-
-          # Minimal invocation that preserves the original vulnerable semantic:
-          # trusted diff.groovy will checkout forked/$BRANCH inside $REPO
-          # and run mvn clean install there.
+      
+          ls -la
+          ls -la "$REPO"
+          git -C "$REPO" remote -v
+          git -C "$REPO" branch -a | grep forked || true
+      
           groovy diff.groovy -r "$REPO" -p "$REF" \
-            -c ../../../../sun_checks.xml \
-            -l ../../../../.ci-temp/contribution/checkstyle-tester/projects-to-test-on.properties || true
+            -c "$REPO/sun_checks.xml" \
+            -l "projects-to-test-on.properties"
 
       - name: Create minimal message
         run: |
