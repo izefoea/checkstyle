@@ -1,14 +1,8 @@
 name: Diff-Report-PoC
 
-#####################################################################################
-# Minimal reproduction of the original cross-repo diff-report chain:
-# - issue_comment trigger
-# - checkout base repo
-# - fetch PR branch from forked remote
-# - download contribution repo
-# - run trusted diff.groovy from contribution
-# - diff.groovy internally checks out forked/$BRANCH and runs mvn clean install
-#####################################################################################
+env:
+  DEFAULT_PROJECTS_LINK: "https://raw.githubusercontent.com/checkstyle/contribution/master/checkstyle-tester/projects-to-test-on-for-github-action.properties"
+
 on:
   issue_comment:
     types: [created, edited]
@@ -26,9 +20,17 @@ jobs:
     if: github.event.comment.body == 'GitHub, generate report'
     runs-on: ubuntu-latest
     outputs:
-      branch: ${{ steps.branch.outputs.ref }}
-      commit_sha: ${{ steps.branch.outputs.commit_sha }}
-      fork_repo: ${{ steps.branch.outputs.fork_repo }}
+      projects_link: ${{ steps.parse.outputs.projects_link }}
+      config_link: ${{ steps.parse.outputs.config_link }}
+      new_module_config_link: ${{ steps.parse.outputs.new_module_config_link }}
+      patch_config_link: ${{ steps.parse.outputs.patch_config_link }}
+      report_label: ${{ steps.parse.outputs.report_label }}
+      head_ref: ${{ steps.pr.outputs.head_ref }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      head_repo: ${{ steps.pr.outputs.head_repo }}
+      base_ref: ${{ steps.pr.outputs.base_ref }}
+      base_repo: ${{ steps.pr.outputs.base_repo }}
+      commit_sha: ${{ steps.pr.outputs.commit_sha }}
 
     steps:
       - name: React to comment
@@ -46,33 +48,50 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Getting PR info
+      - name: Getting PR description and PR info
         env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
           PULL_REQUEST_URL: ${{ github.event.issue.pull_request.url }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p .ci-temp
-      
+          echo "$ISSUE_BODY" > .ci-temp/windows.txt
+          tr -d '\15\32' < .ci-temp/windows.txt > .ci-temp/text
+
           curl --fail-with-body -X GET "${PULL_REQUEST_URL}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: token $GITHUB_TOKEN" \
-              -o .ci-temp/info.json
-      
-          jq --raw-output .head.ref .ci-temp/info.json > .ci-temp/branch
-          jq --raw-output .head.sha .ci-temp/info.json > .ci-temp/commit_sha
-          jq --raw-output .head.repo.full_name .ci-temp/info.json > .ci-temp/fork_repo
-      
-      - name: Set branch
-        id: branch
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -o .ci-temp/info.json
+
+          jq --raw-output .head.ref .ci-temp/info.json > .ci-temp/head_ref
+          jq --raw-output .head.sha .ci-temp/info.json > .ci-temp/head_sha
+          jq --raw-output .head.repo.full_name .ci-temp/info.json > .ci-temp/head_repo
+
+          jq --raw-output .base.ref .ci-temp/info.json > .ci-temp/base_ref
+          jq --raw-output .base.repo.full_name .ci-temp/info.json > .ci-temp/base_repo
+
+      - name: Parse PR description
+        id: parse
         run: |
-          echo "ref=$(cat .ci-temp/branch)" >> "$GITHUB_OUTPUT"
-          echo "commit_sha=$(cat .ci-temp/commit_sha | cut -c 1-7)" >> "$GITHUB_OUTPUT"
-          echo "fork_repo=$(cat .ci-temp/fork_repo)" >> "$GITHUB_OUTPUT"
+          ./.ci/diff-report.sh parse-pr-description-text
+
+      - name: Set PR outputs
+        id: pr
+        run: |
+          ./.ci/append-to-github-output.sh "head_ref" "$(cat .ci-temp/head_ref)"
+          ./.ci/append-to-github-output.sh "head_sha" "$(cat .ci-temp/head_sha)"
+          ./.ci/append-to-github-output.sh "head_repo" "$(cat .ci-temp/head_repo)"
+          ./.ci/append-to-github-output.sh "base_ref" "$(cat .ci-temp/base_ref)"
+          ./.ci/append-to-github-output.sh "base_repo" "$(cat .ci-temp/base_repo)"
+          ./.ci/append-to-github-output.sh "commit_sha" "$(cat .ci-temp/head_sha | cut -c 1-7)"
+
+          echo "GITHUB_OUTPUT:"
+          echo "$(cat "$GITHUB_OUTPUT")"
 
   make_report:
     runs-on: ubuntu-latest
     needs: parse_body
-    if: needs.parse_body.outputs.branch != ''
+    if: needs.parse_body.outputs.config_link != '' || needs.parse_body.outputs.new_module_config_link != ''
     outputs:
       message: ${{ steps.out.outputs.message }}
 
@@ -80,21 +99,30 @@ jobs:
       - name: Download checkstyle
         uses: actions/checkout@v6
 
-      # set main checkstyle repo as an upstream
-      # Diff report will be generated taking upstream's master branch as a base branch
-      - name: set upstream
+      - name: Download files
+        env:
+          NEW_MODULE_CONFIG_LINK: ${{ needs.parse_body.outputs.new_module_config_link }}
+          DIFF_CONFIG_LINK: ${{ needs.parse_body.outputs.config_link }}
+          PATCH_CONFIG_LINK: ${{ needs.parse_body.outputs.patch_config_link }}
+          DIFF_PROJECTS_LINK: ${{ needs.parse_body.outputs.projects_link }}
+          DEFAULT_PROJECTS_LINK: ${{ env.DEFAULT_PROJECTS_LINK }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          MAIN_REPO_GIT_URL="https://github.com/checkstyle/checkstyle.git"
-          git remote add upstream "$MAIN_REPO_GIT_URL"
+          ./.ci/diff-report.sh download-files
+
+      - name: Set base and head remotes
+        run: |
+          BASE_REPO_GIT_URL="https://github.com/${{ needs.parse_body.outputs.base_repo }}.git"
+          HEAD_REPO_GIT_URL="https://github.com/${{ needs.parse_body.outputs.head_repo }}.git"
+
+          git remote add upstream "$BASE_REPO_GIT_URL"
           git fetch upstream
-      
-          echo "fork repo from parse_body: ${{ needs.parse_body.outputs.fork_repo }}"
-          FORK_REPO_GIT_URL="https://github.com/${{ needs.parse_body.outputs.fork_repo }}.git"
-          git remote add forked "$FORK_REPO_GIT_URL"
+
+          git remote add forked "$HEAD_REPO_GIT_URL"
           git fetch forked
-      
+
           git remote -v
-          git branch -r | grep forked || true
+          git branch -r | grep -E 'upstream|forked' || true
 
       - name: Setup local maven cache
         uses: actions/cache@v5
@@ -116,7 +144,9 @@ jobs:
 
       - name: Prepare environment
         run: |
-          mkdir -p .ci-temp/contribution/checkstyle-tester
+          mv .ci-temp/projects.properties ./.ci-temp/contribution/checkstyle-tester/
+          mv .ci-temp/*.xml ./.ci-temp/contribution/checkstyle-tester/
+
           curl --fail-with-body -s "https://get.sdkman.io" | bash
           source "$HOME/.sdkman/bin/sdkman-init.sh"
           sdk install groovy
@@ -124,27 +154,38 @@ jobs:
 
       - name: Generate report
         env:
-          BRANCH: ${{ needs.parse_body.outputs.branch }}
+          HEAD_REF: ${{ needs.parse_body.outputs.head_ref }}
+          BASE_REF: ${{ needs.parse_body.outputs.base_ref }}
         run: |
           cd .ci-temp/contribution/checkstyle-tester
-          REF="forked/$BRANCH"
-          REPO="../../.."
-          BASE_BRANCH="upstream/master"
+          REF="forked/$HEAD_REF"
+          REPO="../../../../checkstyle"
+          BASE_BRANCH="upstream/$BASE_REF"
           export MAVEN_OPTS="-Xmx5g"
-      
+
           echo "pwd=$(pwd)"
           echo "Using REPO=$REPO"
           echo "Using REF=$REF"
           echo "Using BASE_BRANCH=$BASE_BRANCH"
-      
+
           ls -la
           ls -la "$REPO"
           git -C "$REPO" remote -v
-          git -C "$REPO" branch -a | grep forked || true
-      
-          groovy diff.groovy -r "$REPO" -p "$REF" \
-            -c "$REPO/sun_checks.xml" \
-            -l "projects-to-test-on.properties"
+          git -C "$REPO" branch -a | grep -E 'upstream|forked' || true
+
+          if [ -f new_module_config.xml ]; then
+            echo "Generating report for new module"
+            groovy diff.groovy -r "$REPO" -p "$REF" -pc new_module_config.xml -m single \
+              -l projects.properties -xm "-Dcheckstyle.failsOnError=false" --allowExcludes
+          elif [ -f patch_config.xml ]; then
+            echo "Generating report with patch config"
+            groovy diff.groovy -r "$REPO" -b "$BASE_BRANCH" -p "$REF" -bc diff_config.xml \
+              -pc patch_config.xml -l projects.properties -xm "-Dcheckstyle.failsOnError=false" --allowExcludes
+          else
+            echo "Generating standard diff report"
+            groovy diff.groovy -r "$REPO" -b "$BASE_BRANCH" -p "$REF" -c diff_config.xml \
+              -l projects.properties -xm "-Dcheckstyle.failsOnError=false" --allowExcludes
+          fi
 
       - name: Create minimal message
         run: |
@@ -154,7 +195,7 @@ jobs:
       - name: Set output
         id: out
         run: |
-          echo "message=$(cat .ci-temp/message)" >> "$GITHUB_OUTPUT"
+          ./.ci/append-to-github-output.sh "message" "$(cat .ci-temp/message)"
 
   send_message:
     runs-on: ubuntu-latest
@@ -172,7 +213,20 @@ jobs:
           mkdir -p .ci-temp
           if [ -z "$MSG" ]; then
             JOBS_LINK="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            echo "PoC failed. Link: $JOBS_LINK" > .ci-temp/message
+            API_LINK="https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs"
+
+            curl --fail-with-body -X GET "${API_LINK}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -o .ci-temp/info.json
+
+            jq '.jobs' .ci-temp/info.json > .ci-temp/jobs
+            jq '.[] | select(.conclusion == "failure") | .name' .ci-temp/jobs > .ci-temp/job_name
+            jq '.[] | select(.conclusion == "failure") | .steps' .ci-temp/jobs > .ci-temp/steps
+            jq '.[] | select(.conclusion == "failure") | .name' .ci-temp/steps > .ci-temp/step_name
+
+            echo "Report generation failed on phase $(cat .ci-temp/job_name)," > .ci-temp/message
+            echo "step $(cat .ci-temp/step_name).<br>Link: $JOBS_LINK" >> .ci-temp/message
           else
             echo "$MSG" > .ci-temp/message
           fi
@@ -180,7 +234,7 @@ jobs:
       - name: Set message
         id: out
         run: |
-          echo "message=$(cat .ci-temp/message)" >> "$GITHUB_OUTPUT"
+          ./.ci/append-to-github-output.sh "message" "$(cat .ci-temp/message)"
 
       - name: Comment PR
         uses: actions/github-script@v8
